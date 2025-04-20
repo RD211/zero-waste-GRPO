@@ -12,14 +12,7 @@ cleanup() {
 # Trap Ctrl+C (SIGINT) and SIGTERM
 trap cleanup INT TERM
 
-# -----------------------------------------------------------
-# Accelerate config file
-# -----------------------------------------------------------
 ACCELERATE_CONFIG=""
-
-# -----------------------------------------------------------
-# Arrays for storing args for each command
-# -----------------------------------------------------------
 SERVER_ARGS=()
 TRAIN_ARGS=()
 
@@ -77,6 +70,5 @@ accelerate launch --config_file "$ACCELERATE_CONFIG" train_rl.py "${TRAIN_ARGS[@
 # Kill servers after training
 # -----------------------------------------------------------
 ./stop_vllm_server.sh
-
 
 echo "[start_rl_training.sh] Done."

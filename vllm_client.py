@@ -16,3 +16,11 @@ def generate(
     response_list = response.json()["generations"]
     results: list[str] = [item for item in response_list]
     return results
+
+def shutdown(
+    server_port: int = 8005,
+):
+    server_url = f"http://localhost:{server_port}/shutdown"
+    response = requests.post(server_url)
+    response.raise_for_status() 
+    return response.json()

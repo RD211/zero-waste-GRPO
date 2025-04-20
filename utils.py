@@ -11,20 +11,24 @@ from torch.optim.lr_scheduler import LambdaLR
 from datasets import load_dataset, Dataset, concatenate_datasets
 from configs.cfg import DatasetConfig
 from concurrent.futures import ThreadPoolExecutor
-    
+import pynvml
+pynvml.nvmlInit()
 
 class GPUFormatter(logging.Formatter):
     def __init__(self, fmt=None, datefmt=None, style='%', rank=0):
         super().__init__(fmt, datefmt, style)
         self.rank = rank
-        self.total_mem_mb = 96 * 1024  # 96 GB in MB
 
     def format(self, record):
         if torch.cuda.is_available():
             gpu_id = torch.cuda.current_device()
-            mem_alloc = torch.cuda.memory_allocated(gpu_id) / 1024**2  # in MB
-            usage_pct = (mem_alloc / self.total_mem_mb) * 100
-            gpu_stats = f"GPU{gpu_id}: {mem_alloc:.1f}MB ({usage_pct:.1f}%)"
+
+            handle   = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+            info     = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            used_mb  = info.used   / 1024**2
+            total_mb = info.total  / 1024**2
+            pct      = used_mb / total_mb * 100
+            gpu_stats = f"GPU{gpu_id}: {used_mb:.1f}/{total_mb:.1f} MB ({pct:.1f}%)"
         else:
             gpu_stats = "GPU: N/A"
 

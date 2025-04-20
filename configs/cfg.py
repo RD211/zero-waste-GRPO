@@ -15,7 +15,7 @@ class ModelvLLMConfig:
     max_length: int = 8192
     max_num_seqs: int = 256
 
-    gpu_memory_utilization: float = 0.5
+    gpu_memory_utilization: float = 0.3
     number_of_gpus_per_instance: int = 4
 
     use_v0: bool = True
@@ -39,18 +39,26 @@ class TrainConfig:
     # GRPO Specific
     num_problems_per_batch: int = 4 # Number of problems per batch
     group_size: int = 8 # Number of attempts per problem
-    beta: float = 0.0001
+    beta: float = 0.04
+    loss_type: str = "grpo" # bnpo, grpo or dr_grpo
+    
+    normalize_reward: bool = True
+    
+    
+    #TODO: Implement this.
     mu: int = 4
     epsilon: float = 0.2
-    gradient_accumulation_steps: int = 4
+    ######################
+    
+    
+    gradient_accumulation_steps: int = 4 # We have num_problems_per_batch * group_size / gpus that we can divide.
 
-    learning_rate: float = 5e-7
-    lr_warmup_steps: int = 20
+    learning_rate: float = 1e-6
+    lr_warmup_steps: int = 0
     fused_optimizer: bool = False
     max_grad_norm: float = 1.0
     
-    epochs: int = 1
-    max_steps: int = -1
+    max_steps: int = 1000
 
 
     gradient_checkpointing: bool = True
@@ -61,9 +69,9 @@ class TrainConfig:
     
 @dataclass
 class LoggingConfig:
-    wandb: bool = False
+    wandb: bool = True
     
-    wandb_project: str = "train-rl"
+    wandb_project: str = "train-grpo"
     wandb_run_name: str = "Llama3-8B"
     wandb_entity: str = "rd211"
     
@@ -75,9 +83,11 @@ class LoggingConfig:
 @dataclass
 class CheckpointConfig:
     
-    save_steps: int = 1000
+    save_steps: int = 100000
     save_total_limit: int = 3
-          
+    save_dir: str = "/iopsstor/scratch/cscs/ddinucu/GRPO/checkpoints/llama3-8b"
+    save_seconds_before_timelimit: int = 60 * 5
+    
 @dataclass
 class RLModelTrainingConfig:
     

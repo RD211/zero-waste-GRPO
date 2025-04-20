@@ -76,7 +76,9 @@ class SimplevLLMInference:
 
     def cleanup(self):
         del self.llm
+        gc.collect()
         torch.cuda.empty_cache()
+        torch.distributed.destroy_process_group()
         self.logger.info("vllmInference cleaned up")
 
 
