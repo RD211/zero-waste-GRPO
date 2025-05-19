@@ -2,4 +2,4 @@ def dumb_reward_func(
     completion: str,
     answer: str,
 ):
-    return -len(completion) / 4096
+    return abs(len(completion) - 512) / 512

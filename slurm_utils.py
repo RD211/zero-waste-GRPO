@@ -3,7 +3,7 @@ import re
 import signal
 from utils import init_logger
 import subprocess
-logger = init_logger(rank=0)
+logger = init_logger(rank=os.getenv("RANK", 0))
 
 SLURM_JOB_ID = os.environ.get("SLURM_JOB_ID")
 SHOULD_QUIT = False

@@ -1,0 +1,40 @@
+model:
+  model_name_or_path: "Qwen/Qwen2.5-7B-Instruct"
+  max_length: 1024
+
+train:
+  # GRPO-specific
+  num_problems_per_batch: 2   # Number of problems per batch
+  group_size: 4               # Number of attempts per problem
+  beta: 0.000004
+
+  # Optimisation
+  gradient_accumulation_steps: 1   # num_problems_per_batch * group_size / gpus
+  learning_rate: 1e-5
+  lr_warmup_steps: 0
+  fused_optimizer: false
+  max_grad_norm: 1.0
+
+  max_steps: 5
+
+  gradient_checkpointing: true
+  deepspeed_config_path: "configs/deepspeed/zero2.yaml"
+
+  ref_model_inference_batch_size: 1
+  use_liger_loss: true
+
+logging:
+  wandb: true
+  wandb_project: "train-grpo"
+  wandb_run_name: "Qwen-7b-Liger-1024"
+  wandb_entity: "rd211"
+  run_group: "7b"
+  wandb_tags: ["7b"]
+
+checkpoint:
+  save_steps: 100000
+  save_total_limit: 3
+  save_dir: "/iopsstor/scratch/cscs/ddinucu/GRPO/checkpoints/qwen-7b"
+
+seed: 42
+server_port: 8005

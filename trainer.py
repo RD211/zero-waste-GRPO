@@ -4,10 +4,11 @@ import copy
 import json, shutil, itertools
 from datetime import timedelta
 from typing import List, Dict, Callable, Sequence
+from tracker import gpu_profiler, gpu_tracker
 
 import torch
 import deepspeed
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from accelerate import Accelerator, InitProcessGroupKwargs
 from huggingface_hub import snapshot_download
@@ -100,15 +101,18 @@ class RLTrainer:
         self.accelerator.wait_for_everyone()
 
         # Hot model
-        self.model = AutoLigerKernelForCausalLM.from_pretrained(
+
+        auto_model_class = AutoLigerKernelForCausalLM if self.cfg.train.use_liger_loss else AutoModelForCausalLM
+        self.model = auto_model_class.from_pretrained(
             model_cfg.model_name_or_path,
             use_cache=not train_cfg.gradient_checkpointing,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
         )
+        self.logger.info(f"Hot model loaded.")
 
         # Reference model
-        self.ref_model = AutoLigerKernelForCausalLM.from_pretrained(
+        self.ref_model = auto_model_class.from_pretrained(
             model_cfg.model_name_or_path,
             use_cache=not train_cfg.gradient_checkpointing,
             trust_remote_code=True,
@@ -122,7 +126,7 @@ class RLTrainer:
             {
                 "zero_optimization": {
                     "stage": 3,
-                    "offload_param":  {"device": "cpu", "pin_memory": True},
+                    "offload_param": {"device": "cpu", "pin_memory": True},
                     "offload_optimizer": {"device": "cpu", "pin_memory": True},
                     "overlap_comm": False,
                     "contiguous_gradients": False,
@@ -177,7 +181,7 @@ class RLTrainer:
         self.loss_fn = LigerFusedLinearGRPOLoss(
             beta=train_cfg.beta,
             use_ref_model=True,
-            loss_type="grpo",
+            loss_type=cfg.train.loss_type,
             temperature=model_cfg.temperature,
         )
 
@@ -191,7 +195,6 @@ class RLTrainer:
 
         self.logger.info("Starting training")
         start = self._current_step
-
 
         # We skip this many steps.
         i = 0
@@ -217,15 +220,19 @@ class RLTrainer:
             dup_prompts = [p for p in prompts for _ in range(g_size)]
             dup_solutions = [s for s in solutions for _ in range(g_size)]
 
-            self.logger.info(
-                f"Node {self.node_id}: sampling {len(dup_prompts)} generations"
-            )
             gens = self._sample_with_vllm(state_dict, dup_prompts)
             self.logger.info(f"Node {self.node_id}: sampled {len(gens)} generations")
 
             self.logger.info("Computing rewards and advantages")
+
+            self.logger.info(
+                f"Prompts: {len(prompts)}, with number of duplicates: {len(dup_solutions)}"
+            )
             rewards = self._compute_rewards(gens, dup_solutions)
             advantages = self._compute_advantages(rewards, g_size)
+            self.logger.info(
+                f"gens: {[len(g) for g in gens]}, rewards: {rewards}, advantages: {advantages}"
+            )
 
             self.logger.info("Computing reference logps")
             conversations = [
@@ -241,6 +248,9 @@ class RLTrainer:
             ids = self.tokenizer(txt, add_special_tokens=False)["input_ids"]
 
             ref_logps = self._compute_reference_logps(ids)
+            # We assert the lengths of the ids are bigger by 1 than the ref_logps
+            for i, (id_seq, ref_seq) in enumerate(zip(ids, ref_logps)):
+                assert len(id_seq) == len(ref_seq) + 1, f"seq {i} has wrong length"
 
             self.logger.info("Updating policy")
             self._reload_optimizer_and_policy()
@@ -249,7 +259,9 @@ class RLTrainer:
             self.logger.info(
                 f"Step {step}: loss: {loss:.4f}, kl: {kl:.4f}, reward: {torch.mean(torch.tensor(rewards)):.4f}, token_len: {token_len:.4f}"
             )
+
             if self.cfg.logging.wandb and self.accelerator.is_main_process:
+
                 wandb.log(
                     {
                         "reward": torch.mean(torch.tensor(rewards)),
@@ -308,19 +320,32 @@ class RLTrainer:
 
         # Slice prompts belonging to this node
         local_prompts = prompts[self.node_id * per_node : (self.node_id + 1) * per_node]
+        self.logger.info(
+            f"Node {self.node_id}: sampling {len(local_prompts)} generations"
+        )
 
         gens: List[str] = [None] * per_node
         if self.accelerator.is_local_main_process:
-            self.logger.info(f"Node {self.node_id}: sampling with vLLM")
             meta = create_shared_state_dict(state_dict)
-            gens = generate(local_prompts, get_shareable_version(meta))
-            gens = [(self.node_id, g) for g in gens]
+            del state_dict
+            gc.collect()
+            torch.cuda.empty_cache()
+            self.logger.info("Meta created and delete old state_dict")
+            shared_meta = get_shareable_version(meta)
+            self.logger.info("Meta shared")
+            gens = generate(local_prompts, shared_meta)
+            gens = [(self.node_id, i, g) for i, g in enumerate(gens)]
+
+            # for m in meta.values():
+            #     shm = m['_shm_obj']
+            #     shm.close()
+            #     shm.unlink()
 
         self.accelerator.wait_for_everyone()
         gens_all = self.accelerator.gather_for_metrics(gens)
         gens_all = [g for g in gens_all if g is not None]
-        gens_all.sort(key=lambda x: x[0])
-        return [g[1] for g in gens_all]
+        gens_all.sort(key=lambda x: (x[0], x[1]))
+        return [g[2] for g in gens_all]
 
     def _compute_rewards(
         self, generations: List[str], answers: List[str]
@@ -341,8 +366,8 @@ class RLTrainer:
         ]
         advantages = []
         for g in grouped:
-            mean = sum(g) / len(g)
-            std = (sum((x - mean) ** 2 for x in g) / len(g)) ** 0.5
+            mean = sum(g) / group_size
+            std = (sum((x - mean) ** 2 for x in g) / group_size) ** 0.5
             advantages.extend(
                 [
                     (r - mean)
@@ -391,7 +416,7 @@ class RLTrainer:
             tok_logps = tok_logps * (attention_mask[:, 1:] == 1)
 
             for row, ln in zip(tok_logps, lens):
-                ref_logps_local.append(row[:ln].cpu().tolist())
+                ref_logps_local.append(row[: ln - 1].cpu().tolist())
 
         gathered = self.accelerator.gather_for_metrics(
             list(
@@ -400,6 +425,73 @@ class RLTrainer:
         )
         gathered.sort(key=lambda x: x[0])
         return [g[1] for g in gathered]
+
+    # ------------------------------------------------------------------
+    # Policy update
+    # ------------------------------------------------------------------
+    @gpu_profiler("liger_loss")
+    def _compute_liger_loss(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        ref_tensor: torch.Tensor,
+        adv_tensor: list,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        pass
+    
+    @gpu_profiler("torch_loss")
+    def _compute_torch_loss(
+        self,
+        model,
+        input_ids: torch.Tensor,  # (B, L)
+        attention_mask: torch.Tensor,  # (B, L)
+        ref_tensor: torch.Tensor,  # (B, L-1) reference log-ps for t+1 tokens
+        adv_tensor: torch.Tensor,  # (B,)
+        selected_token_ids: torch.Tensor,  # (B, L-1) == input_ids[:, 1:]
+    ) -> tuple[torch.Tensor, tuple[float]]:
+
+        B, L = input_ids.shape
+
+        logits = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            logits_to_keep=L,
+        ).logits  # (B, L, V)
+
+        logits = logits[:, :-1, :]  # (B, L-1, V) – shift
+        logits = logits / self.cfg.model.temperature
+
+        logps = torch.nn.functional.log_softmax(logits, dim=-1)
+        per_tok_logps = logps.gather(-1, selected_token_ids.unsqueeze(-1)).squeeze(
+            -1
+        )  # (B, L-1)
+
+        per_tok_kl = (
+            torch.exp(ref_tensor - per_tok_logps) - (ref_tensor - per_tok_logps) - 1.0
+        )  # (B, L-1)
+
+        old_per_tok_logps = per_tok_logps.detach()
+        ratio = torch.exp(per_tok_logps - old_per_tok_logps)
+        eps = self.cfg.train.epsilon
+        ratio_clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps)
+
+        adv_expanded = adv_tensor.unsqueeze(1).expand_as(per_tok_logps)
+
+        loss_1 = ratio * adv_expanded
+        loss_2 = ratio_clipped * adv_expanded
+        per_tok_loss = -torch.min(loss_1, loss_2)
+
+        beta = self.cfg.train.beta
+        if beta != 0.0:
+            per_tok_loss = per_tok_loss + beta * per_tok_kl
+
+        token_mask = attention_mask[:, 1:].to(per_tok_loss.dtype)  # (B, L-1)
+
+        loss = (per_tok_loss * token_mask).sum() / token_mask.sum()
+
+        mean_kl = ((per_tok_kl * token_mask).sum() / token_mask.sum()).item()
+
+        return loss, (mean_kl,)
 
     def _policy_update(
         self,
@@ -413,6 +505,9 @@ class RLTrainer:
         ids_local = ids[start:end]
         ref_logps_local = ref_logps[start:end]
         adv_local = advantages[start:end]
+
+        # all must have the same length
+        assert len(ids_local) == len(ref_logps_local) == len(adv_local)
 
         micro_bs = (
             self.cfg.train.num_problems_per_batch
@@ -443,42 +538,64 @@ class RLTrainer:
                 seq_range < torch.tensor(lengths, device=self.device).unsqueeze(1)
             ).long()
 
-            hidden = unwrapped.model(
-                input_ids=input_ids,
-                attention_mask=attn_mask,
-            ).last_hidden_state[:, :-1, :]
             tgt_ids = input_ids[:, 1:]
-            msk = attn_mask[:, 1:]
 
             ref_tensor = torch.zeros((B, L - 1), device=self.device)
             for i, row in enumerate(ref_mb):
                 ref_tensor[i, : len(row)] = torch.tensor(row, device=self.device)
 
             adv_tensor = torch.tensor(adv_mb, device=self.device, dtype=torch.float32)
+            loss, metrics = None, None
+            if self.cfg.train.use_liger_loss:
 
-            with deepspeed.zero.GatheredParameters(
-                [unwrapped.lm_head.weight, unwrapped.lm_head.bias], modifier_rank=None
-            ):
-                loss, metrics = self.loss_fn(
-                    _input=hidden,
-                    lin_weight=unwrapped.lm_head.weight,
+                gp = deepspeed.zero.GatheredParameters(
+                    [unwrapped.lm_head.weight, unwrapped.lm_head.bias],
+                modifier_rank=None)
+                gp.__enter__()
+
+                with gpu_tracker("liger_loss",
+                                 self._current_step,
+                                 log_to_wandb=self.cfg.logging.wandb,
+                                 accel=self.accelerator):
+                    hidden = unwrapped.model(
+                        input_ids=input_ids,
+                        attention_mask=attn_mask,
+                    ).last_hidden_state[:, :-1, :]
+
+                    tgt_ids = input_ids[:, 1:]
+                    msk = attn_mask[:, 1:]
+
+                    loss, metrics = self.loss_fn(
+                        _input=hidden,
+                        lin_weight=unwrapped.lm_head.weight,
+                        selected_token_ids=tgt_ids,
+                        attention_mask=msk,
+                        bias=unwrapped.lm_head.bias,
+                        advantages=adv_tensor,
+                        ref_per_token_logps=ref_tensor,
+                    )
+                    
+                self.accelerator.backward(loss)
+                gp.__exit__(None, None, None)
+                
+            else:
+                loss, metrics = self._compute_torch_loss(
+                    self.model,
+                    input_ids=input_ids,
+                    attention_mask=attn_mask,
+                    ref_tensor=ref_tensor,
+                    adv_tensor=adv_tensor,
                     selected_token_ids=tgt_ids,
-                    attention_mask=msk,
-                    bias=unwrapped.lm_head.bias,
-                    advantages=adv_tensor,
-                    ref_per_token_logps=ref_tensor,
                 )
-
                 self.accelerator.backward(loss)
 
             total_loss += loss.item() * B
             total_kl += metrics[0] * B
             total_tokens += sum(lengths)
 
-            del hidden
             gc.collect()
             torch.cuda.empty_cache()
-        
+
         self.accelerator.clip_grad_norm_(
             self.model.parameters(), self.cfg.train.max_grad_norm
         )

@@ -14,29 +14,38 @@ from concurrent.futures import ThreadPoolExecutor
 import pynvml
 pynvml.nvmlInit()
 
+import logging
+import torch
+import psutil
+
 class GPUFormatter(logging.Formatter):
     def __init__(self, fmt=None, datefmt=None, style='%', rank=0):
         super().__init__(fmt, datefmt, style)
-        self.rank = rank
+        self.rank = int(str(rank))
+        pynvml.nvmlInit()
 
     def format(self, record):
         if torch.cuda.is_available():
-            gpu_id = torch.cuda.current_device()
-
-            handle   = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
-            info     = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            used_mb  = info.used   / 1024**2
-            total_mb = info.total  / 1024**2
+            gpu_id = self.rank % torch.cuda.device_count()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+            info   = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            used_mb  = info.used  / 1024**2
+            total_mb = info.total / 1024**2
             pct      = used_mb / total_mb * 100
-            gpu_stats = f"GPU{gpu_id}: {used_mb:.1f}/{total_mb:.1f} MB ({pct:.1f}%)"
+            record.gpu = f"GPU{gpu_id}: {used_mb:.1f}/{total_mb:.1f} MB ({pct:.1f}%)"
         else:
-            gpu_stats = "GPU: N/A"
+            record.gpu = "GPU: N/A"
 
-        record.gpu = gpu_stats
+        vm = psutil.virtual_memory()
+        used_gb  = vm.used  / 1024**3
+        total_gb = vm.total / 1024**3
+        record.ram = f"RAM: {used_gb:.1f}/{total_gb:.1f} GB ({vm.percent:.1f}%)"
+
         record.rank = self.rank
+
         return super().format(record)
 
-def init_logger(rank):
+def init_logger(rank=0):
     logger = logging.getLogger("gpu_logger")
     logger.setLevel(logging.INFO)
 
@@ -45,10 +54,11 @@ def init_logger(rank):
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
 
-        formatter = GPUFormatter(
-            fmt="%(asctime)s | rank:%(rank)s | %(name)s | %(levelname)s | %(gpu)s | %(message)s",
-            rank=rank
+        fmt = (
+            "%(asctime)s | rank:%(rank)s | %(name)s | %(levelname)s | "
+            "%(gpu)s | %(ram)s | %(message)s"
         )
+        formatter = GPUFormatter(fmt=fmt, rank=rank)
         ch.setFormatter(formatter)
         logger.addHandler(ch)
 
@@ -199,19 +209,19 @@ def prepare_deepspeed(model, accelerator):
 
 
 
-def gather_incremental_state_dict_to_cpu(accelerator, logger, model, batch_size=60):
+def gather_incremental_state_dict_to_cpu(accelerator, logger, model, batch_size=120):
     state_dict = {}
     
     def _copy_to_cpu(name_param):
         name, param = name_param
         return name, param.detach().cpu()
     
-    
-    # List of (name, parameter) pairs
     params = list(model.named_parameters())
     total = len(params)
     logger.info(f"Gathering {total} parameters in batches of {batch_size}")
 
+    #TODO: Could technically be improved by for each GPU gathering a part and then putting on shared memory and then
+    # gathering the shared memory on the CPU.
     for start in range(0, total, batch_size):
         end = min(total, start + batch_size)
         batch = params[start:end]
