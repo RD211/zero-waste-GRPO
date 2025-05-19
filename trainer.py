@@ -429,25 +429,15 @@ class RLTrainer:
     # ------------------------------------------------------------------
     # Policy update
     # ------------------------------------------------------------------
-    @gpu_profiler("liger_loss")
-    def _compute_liger_loss(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        ref_tensor: torch.Tensor,
-        adv_tensor: list,
-    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        pass
-    
     @gpu_profiler("torch_loss")
     def _compute_torch_loss(
         self,
         model,
-        input_ids: torch.Tensor,  # (B, L)
-        attention_mask: torch.Tensor,  # (B, L)
-        ref_tensor: torch.Tensor,  # (B, L-1) reference log-ps for t+1 tokens
-        adv_tensor: torch.Tensor,  # (B,)
-        selected_token_ids: torch.Tensor,  # (B, L-1) == input_ids[:, 1:]
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        ref_tensor: torch.Tensor,
+        adv_tensor: torch.Tensor,
+        selected_token_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[float]]:
 
         B, L = input_ids.shape
@@ -456,19 +446,19 @@ class RLTrainer:
             input_ids=input_ids,
             attention_mask=attention_mask,
             logits_to_keep=L,
-        ).logits  # (B, L, V)
+        ).logits
 
-        logits = logits[:, :-1, :]  # (B, L-1, V) – shift
+        logits = logits[:, :-1, :]
         logits = logits / self.cfg.model.temperature
 
         logps = torch.nn.functional.log_softmax(logits, dim=-1)
         per_tok_logps = logps.gather(-1, selected_token_ids.unsqueeze(-1)).squeeze(
             -1
-        )  # (B, L-1)
+        )
 
         per_tok_kl = (
             torch.exp(ref_tensor - per_tok_logps) - (ref_tensor - per_tok_logps) - 1.0
-        )  # (B, L-1)
+        )
 
         old_per_tok_logps = per_tok_logps.detach()
         ratio = torch.exp(per_tok_logps - old_per_tok_logps)
@@ -485,7 +475,7 @@ class RLTrainer:
         if beta != 0.0:
             per_tok_loss = per_tok_loss + beta * per_tok_kl
 
-        token_mask = attention_mask[:, 1:].to(per_tok_loss.dtype)  # (B, L-1)
+        token_mask = attention_mask[:, 1:].to(per_tok_loss.dtype)
 
         loss = (per_tok_loss * token_mask).sum() / token_mask.sum()
 
