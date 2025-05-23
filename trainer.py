@@ -17,7 +17,6 @@ import wandb
 from utils import (
     build_lr_scheduler,
     init_logger,
-    prepare_deepspeed,
     gather_incremental_state_dict_to_cpu,
 )
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
@@ -27,6 +26,9 @@ from vllm_client import generate, shutdown
 from configs.cfg import RLModelTrainingConfig
 from slurm_utils import get_slurm_time_left, received_term
 import torch
+from accelerate.utils import FP8RecipeKwargs, InitProcessGroupKwargs
+from fp8 import fp8ify_module
+import transformer_engine.pytorch as te
 
 _orig_load = torch.load
 
@@ -51,8 +53,22 @@ class RLTrainer:
         self.train_dataset = train_dataset.batch(cfg.train.num_problems_per_batch)
         self.reward_functions = reward_functions
 
+        fp8_kwargs = None
+        if self.cfg.train.fp8_training:
+            fp8_kwargs = FP8RecipeKwargs(
+                backend='te',
+                fp8_format="HYBRID",
+                amax_compute_algo="max",
+                amax_history_len=1024,
+                interval=1,
+            )
+        self.fp8_recipe = fp8_kwargs
+
         self.accelerator = Accelerator(
-            kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=1))]
+            mixed_precision='fp8' if self.cfg.train.fp8_training else 'bf16',
+            kwargs_handlers=[
+                InitProcessGroupKwargs(timeout=timedelta(hours=1)), # 1 hour timeout for vllm sampling
+            ] + ([fp8_kwargs] if fp8_kwargs else []),
         )
         self.device = self.accelerator.device
         self.num_nodes = int(os.environ.get("NNODES", 1))
@@ -101,14 +117,23 @@ class RLTrainer:
         self.accelerator.wait_for_everyone()
 
         # Hot model
-
-        auto_model_class = AutoLigerKernelForCausalLM if self.cfg.train.use_liger_loss else AutoModelForCausalLM
+        auto_model_class = (
+            AutoLigerKernelForCausalLM
+            if self.cfg.train.use_liger_loss
+            else AutoModelForCausalLM
+        )
         self.model = auto_model_class.from_pretrained(
             model_cfg.model_name_or_path,
             use_cache=not train_cfg.gradient_checkpointing,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
         )
+
+        if self.cfg.train.fp8_training:
+            fp8ify_module(
+                self.model
+            )
+        print(f"Model {self.model} loaded")
         self.logger.info(f"Hot model loaded.")
 
         # Reference model
@@ -196,7 +221,6 @@ class RLTrainer:
         self.logger.info("Starting training")
         start = self._current_step
 
-        # We skip this many steps.
         i = 0
         while i < start:
             next(self.train_iterator)
@@ -311,6 +335,7 @@ class RLTrainer:
             or get_slurm_time_left() < self.cfg.checkpoint.save_seconds_before_timelimit
         )
 
+    @gpu_profiler("vllm_sampling", no_memory_measurement=True)
     def _sample_with_vllm(
         self,
         state_dict: Dict[str, torch.Tensor],
@@ -336,17 +361,13 @@ class RLTrainer:
             gens = generate(local_prompts, shared_meta)
             gens = [(self.node_id, i, g) for i, g in enumerate(gens)]
 
-            # for m in meta.values():
-            #     shm = m['_shm_obj']
-            #     shm.close()
-            #     shm.unlink()
-
         self.accelerator.wait_for_everyone()
         gens_all = self.accelerator.gather_for_metrics(gens)
         gens_all = [g for g in gens_all if g is not None]
         gens_all.sort(key=lambda x: (x[0], x[1]))
         return [g[2] for g in gens_all]
 
+    @gpu_profiler("compute_rewards")
     def _compute_rewards(
         self, generations: List[str], answers: List[str]
     ) -> List[float]:
@@ -359,7 +380,7 @@ class RLTrainer:
         # average over reward functions
         n_fn = len(self.reward_functions)
         return [val / n_fn for val in rewards_per_gen]
-
+    
     def _compute_advantages(self, rewards: List[float], group_size: int) -> List[float]:
         grouped = [
             rewards[i : i + group_size] for i in range(0, len(rewards), group_size)
@@ -377,6 +398,7 @@ class RLTrainer:
             )
         return advantages
 
+    @gpu_profiler("compute_reference_logps")
     def _compute_reference_logps(self, ids: List[List[int]]) -> List[List[float]]:
 
         per_rank = len(ids) // self.accelerator.state.num_processes
@@ -441,45 +463,43 @@ class RLTrainer:
     ) -> tuple[torch.Tensor, tuple[float]]:
 
         B, L = input_ids.shape
+        with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe):
+            logits = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                logits_to_keep=L,
+            ).logits
 
-        logits = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            logits_to_keep=L,
-        ).logits
+            logits = logits[:, :-1, :]
+            logits = logits / self.cfg.model.temperature
 
-        logits = logits[:, :-1, :]
-        logits = logits / self.cfg.model.temperature
+            logps = torch.nn.functional.log_softmax(logits, dim=-1)
+            per_tok_logps = logps.gather(-1, selected_token_ids.unsqueeze(-1)).squeeze(-1)
 
-        logps = torch.nn.functional.log_softmax(logits, dim=-1)
-        per_tok_logps = logps.gather(-1, selected_token_ids.unsqueeze(-1)).squeeze(
-            -1
-        )
+            per_tok_kl = (
+                torch.exp(ref_tensor - per_tok_logps) - (ref_tensor - per_tok_logps) - 1.0
+            )
 
-        per_tok_kl = (
-            torch.exp(ref_tensor - per_tok_logps) - (ref_tensor - per_tok_logps) - 1.0
-        )
+            old_per_tok_logps = per_tok_logps.detach()
+            ratio = torch.exp(per_tok_logps - old_per_tok_logps)
+            eps = self.cfg.train.epsilon
+            ratio_clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps)
 
-        old_per_tok_logps = per_tok_logps.detach()
-        ratio = torch.exp(per_tok_logps - old_per_tok_logps)
-        eps = self.cfg.train.epsilon
-        ratio_clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps)
+            adv_expanded = adv_tensor.unsqueeze(1).expand_as(per_tok_logps)
 
-        adv_expanded = adv_tensor.unsqueeze(1).expand_as(per_tok_logps)
+            loss_1 = ratio * adv_expanded
+            loss_2 = ratio_clipped * adv_expanded
+            per_tok_loss = -torch.min(loss_1, loss_2)
 
-        loss_1 = ratio * adv_expanded
-        loss_2 = ratio_clipped * adv_expanded
-        per_tok_loss = -torch.min(loss_1, loss_2)
+            beta = self.cfg.train.beta
+            if beta != 0.0:
+                per_tok_loss = per_tok_loss + beta * per_tok_kl
 
-        beta = self.cfg.train.beta
-        if beta != 0.0:
-            per_tok_loss = per_tok_loss + beta * per_tok_kl
+            token_mask = attention_mask[:, 1:].to(per_tok_loss.dtype)
 
-        token_mask = attention_mask[:, 1:].to(per_tok_loss.dtype)
+            loss = (per_tok_loss * token_mask).sum() / token_mask.sum()
 
-        loss = (per_tok_loss * token_mask).sum() / token_mask.sum()
-
-        mean_kl = ((per_tok_kl * token_mask).sum() / token_mask.sum()).item()
+            mean_kl = ((per_tok_kl * token_mask).sum() / token_mask.sum()).item()
 
         return loss, (mean_kl,)
 
@@ -540,13 +560,16 @@ class RLTrainer:
 
                 gp = deepspeed.zero.GatheredParameters(
                     [unwrapped.lm_head.weight, unwrapped.lm_head.bias],
-                modifier_rank=None)
+                    modifier_rank=None,
+                )
                 gp.__enter__()
 
-                with gpu_tracker("liger_loss",
-                                 self._current_step,
-                                 log_to_wandb=self.cfg.logging.wandb,
-                                 accel=self.accelerator):
+                with gpu_tracker(
+                    "liger_loss",
+                    self._current_step,
+                    log_to_wandb=self.cfg.logging.wandb,
+                    accel=self.accelerator,
+                ):
                     hidden = unwrapped.model(
                         input_ids=input_ids,
                         attention_mask=attn_mask,
@@ -564,10 +587,10 @@ class RLTrainer:
                         advantages=adv_tensor,
                         ref_per_token_logps=ref_tensor,
                     )
-                    
+
                 self.accelerator.backward(loss)
                 gp.__exit__(None, None, None)
-                
+
             else:
                 loss, metrics = self._compute_torch_loss(
                     self.model,
@@ -626,11 +649,6 @@ class RLTrainer:
         out_dir = self.cfg.checkpoint.save_dir
         path = os.path.join(out_dir, f"step_{self._current_step}")
 
-        # Check if path already exists if so we skip saving.
-        # if os.path.exists(path):
-        #     self.logger.info(f"Checkpoint {path} already exists. Skipping save.")
-        #     return
-
         if self.accelerator.is_main_process:
             os.makedirs(path, exist_ok=True)
         self.accelerator.wait_for_everyone()
@@ -651,11 +669,16 @@ class RLTrainer:
     # ------------------------------------------------------------------
     # Offload stuff to CPU.
     # ------------------------------------------------------------------
+    @gpu_profiler("offload_optimizer_and_policy")
     def _offload_optimizer_and_policy(self):
         from deepspeed.runtime.zero.offload_config import (
             OffloadDeviceEnum,
             OffloadStateTypeEnum,
         )
+
+        # If we are in deepspeed 3
+        if not hasattr(self.model.optimizer, "offload_states"):
+            return
 
         self.logger.info("Offloading optimizer and policy to CPU")
         self.model.optimizer.offload_states(
@@ -665,7 +688,7 @@ class RLTrainer:
                 OffloadStateTypeEnum.hp_params,
                 OffloadStateTypeEnum.lp_params,
                 OffloadStateTypeEnum.lp_grads,
-            ],  # https://deepspeed.readthedocs.io/en/latest/zero3.html#offload-states
+            ],
             device=OffloadDeviceEnum.cpu,
             pin_memory=True,
             non_blocking=True,
@@ -676,7 +699,12 @@ class RLTrainer:
 
         self.logger.info("Optimizer and policy offloaded to CPU")
 
+    @gpu_profiler("reload_optimizer_and_policy")
     def _reload_optimizer_and_policy(self):
+
+        if not hasattr(self.model.optimizer, "offload_states"):
+            return
+        
         self.logger.info("Reloading optimizer and policy from CPU")
         self.model.optimizer.reload_states(non_blocking=True)
         torch.cuda.empty_cache()

@@ -12,10 +12,10 @@ class ModelvLLMConfig:
     top_p: float = 1.0
 
     # vLLM settings
-    max_length: int = 1024
+    max_length: int = 4096
     max_num_seqs: int = 128
 
-    gpu_memory_utilization: float = 0.8
+    gpu_memory_utilization: float = 0.65
     number_of_gpus_per_instance: int = 2
 
     use_v0: bool = True # v1 seems very buggy especially with grace for some reason.
@@ -26,6 +26,8 @@ class Dataset:
     name_or_path: str = "open-r1/Big-Math-RL-Verified-Processed"
     split: str = "train"
     subset: str = "level_3"
+    # Solution is made up of only digits and - and spaces.
+    filter: str = "all(map(lambda x: x.isdigit() or x in ['-', ' '], example['solution']))"
     ratio: float = 1.0
 
 @dataclass
@@ -62,11 +64,12 @@ class TrainConfig:
 
 
     gradient_checkpointing: bool = True
-    deepspeed_config_path: Optional[str] = 'configs/deepspeed/zero2.yaml'
     
     
     ref_model_inference_batch_size: int = 4
     use_liger_loss: bool = True
+
+    fp8_training: bool = False
     
 @dataclass
 class LoggingConfig:
@@ -87,7 +90,7 @@ class CheckpointConfig:
     save_steps: int = 100000
     save_total_limit: int = 3
     save_dir: str = "/iopsstor/scratch/cscs/ddinucu/GRPO/checkpoints/qwen-0.5b"
-    save_seconds_before_timelimit: int = 60 * 5
+    save_seconds_before_timelimit: int = 60 * 8
     
 @dataclass
 class RLModelTrainingConfig:

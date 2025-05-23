@@ -4,7 +4,7 @@ from typing import Callable
 from contextlib import contextmanager
 
 @contextmanager
-def gpu_tracker(name: str, step: int, log_to_wandb: bool, accel, extra: dict | None = None):
+def gpu_tracker(name: str, step: int, log_to_wandb: bool, accel, no_memory_measurement: bool = False, extra: dict | None = None):
     device = torch.cuda.current_device()
     torch.cuda.reset_peak_memory_stats(device)
     start_mem  = torch.cuda.memory_allocated(device)
@@ -22,10 +22,15 @@ def gpu_tracker(name: str, step: int, log_to_wandb: bool, accel, extra: dict | N
             f"{name}/mem_diff_mb" : (peak_mem - start_mem) / 1e6,
             "step"                : step,
         }
+
+        if no_memory_measurement:
+            wandb_log.pop(f"{name}/mem_peak_mb")
+            wandb_log.pop(f"{name}/mem_start_mb")
+            wandb_log.pop(f"{name}/mem_diff_mb")
         if extra: wandb_log.update(extra)
         wandb.log(wandb_log, step=step)
 
-def gpu_profiler(name: str | None = None):
+def gpu_profiler(name: str | None = None, no_memory_measurement: bool = False):
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
@@ -34,7 +39,7 @@ def gpu_profiler(name: str | None = None):
             do_wb = getattr(self.cfg.logging, "wandb", False)
             accel = getattr(self, "accelerator", None)
 
-            with gpu_tracker(tag, step, do_wb, accel):
+            with gpu_tracker(tag, step, do_wb, accel, no_memory_measurement):
                 return func(self, *args, **kwargs)
         return wrapper
     return decorator

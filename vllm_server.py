@@ -76,7 +76,7 @@ def main(cfg: RLModelTrainingConfig):
         model_path=model_config.model_name_or_path,
         gpus_per_instance=model_config.number_of_gpus_per_instance,
         gpu_memory_utilization=model_config.gpu_memory_utilization,
-        max_model_len=model_config.max_length * 2,
+        max_model_len=model_config.max_length,
         max_num_seqs=model_config.max_num_seqs,
         enforce_eager=model_config.enforce_eager,
         use_v0=model_config.use_v0,
@@ -86,7 +86,6 @@ def main(cfg: RLModelTrainingConfig):
         top_k=model_config.top_k,
         top_p=model_config.top_p,
         max_tokens=model_config.max_length,
-        min_tokens=model_config.max_length,
     )
 
     uvicorn.run(app, host="0.0.0.0", port=cfg.server_port)

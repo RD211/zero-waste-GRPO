@@ -5,7 +5,7 @@ from transformers import AutoTokenizer, set_seed
 
 from configs.cfg import RLModelTrainingConfig
 from utils import load_datasets
-from rewards import dumb_reward_func
+from rewards import thinking_reward_func, accuracy_reward_func, length_reward_func
 from trainer import RLTrainer
 from dotenv import load_dotenv
 from pathlib import Path
@@ -24,14 +24,24 @@ def main(cfg: RLModelTrainingConfig) -> None:
     load_dotenv()
     raw_ds = load_datasets(cfg.dataset, cfg.seed)
 
+    print(f"Loaded {len(raw_ds)} examples")
+
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.model.model_name_or_path, trust_remote_code=True
     )
 
     def apply_chat_template(example):
         prompt, solution = example["prompt"], example["solution"]
+
+        template = """
+You are a math problem solver. Solve the following math problem and provide the solution in the boxed format.
+It is crucial you start your solution with a <think> tag and end the thinking with a </think> tag after which you provide the solution in the boxed format.
+
+Here is the math problem:
+{problem}
+"""
         prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
+            [{"role": "user", "content": template.format(problem=prompt)}],
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -42,7 +52,7 @@ def main(cfg: RLModelTrainingConfig) -> None:
     # ------------------------------------------------------------------
     # Rewards
     # ------------------------------------------------------------------
-    reward_fns = [dumb_reward_func]
+    reward_fns = [thinking_reward_func, accuracy_reward_func, length_reward_func]
 
     # ------------------------------------------------------------------
     # Train!

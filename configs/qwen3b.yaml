@@ -17,7 +17,6 @@ train:
   max_steps: 1000
 
   gradient_checkpointing: true
-  deepspeed_config_path: "configs/deepspeed/zero2.yaml"
 
   ref_model_inference_batch_size: 4
 

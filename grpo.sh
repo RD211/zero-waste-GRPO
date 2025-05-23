@@ -30,8 +30,7 @@ srun --nodes=$SLURM_NNODES --ntasks-per-node=1 --export=ALL bash -lc '
     export WANDB_DIR=/iopsstor/scratch/cscs/$USER/wandb
     export HF_HUB_OFFLINE=1
     cd /iopsstor/scratch/cscs/$USER/GRPO
-
-    pip install psutil #TODO: Add this to the actual docker.
+    pip install psutil
 
     ./start_rl_training.sh --config-name qwen7b.yaml \
         --num_processes $WORLD_SIZE \
