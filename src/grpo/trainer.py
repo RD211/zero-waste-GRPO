@@ -1,10 +1,10 @@
 import os
 import gc
 import copy
-import json, shutil, itertools
+import shutil
 from datetime import timedelta
 from typing import List, Dict, Callable, Sequence
-from tracker import gpu_profiler, gpu_tracker
+from src.utils.tracker import gpu_profiler, gpu_tracker
 
 import torch
 import deepspeed
@@ -14,20 +14,20 @@ from accelerate import Accelerator, InitProcessGroupKwargs
 from huggingface_hub import snapshot_download
 from omegaconf import OmegaConf
 import wandb
-from utils import (
+from src.utils.utils import (
     build_lr_scheduler,
     init_logger,
     gather_incremental_state_dict_to_cpu,
 )
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
-from shared_memory import create_shared_state_dict, get_shareable_version
-from vllm_client import generate, shutdown
+from src.utils.shared_memory import create_shared_state_dict, get_shareable_version
+from src.vllm.vllm_client import generate, shutdown
 from configs.cfg import RLModelTrainingConfig
-from slurm_utils import get_slurm_time_left, received_term
+from src.utils.slurm_utils import get_slurm_time_left, received_term
 import torch
 from accelerate.utils import FP8RecipeKwargs, InitProcessGroupKwargs
-from fp8 import fp8ify_module
+from src.misc.fp8 import fp8ify_module
 import transformer_engine.pytorch as te
 
 _orig_load = torch.load
@@ -56,7 +56,7 @@ class RLTrainer:
         fp8_kwargs = None
         if self.cfg.train.fp8_training:
             fp8_kwargs = FP8RecipeKwargs(
-                backend='te',
+                backend="te",
                 fp8_format="HYBRID",
                 amax_compute_algo="max",
                 amax_history_len=1024,
@@ -65,10 +65,13 @@ class RLTrainer:
         self.fp8_recipe = fp8_kwargs
 
         self.accelerator = Accelerator(
-            mixed_precision='fp8' if self.cfg.train.fp8_training else 'bf16',
+            mixed_precision="fp8" if self.cfg.train.fp8_training else "bf16",
             kwargs_handlers=[
-                InitProcessGroupKwargs(timeout=timedelta(hours=1)), # 1 hour timeout for vllm sampling
-            ] + ([fp8_kwargs] if fp8_kwargs else []),
+                InitProcessGroupKwargs(
+                    timeout=timedelta(hours=1)
+                ),  # 1 hour timeout for vllm sampling
+            ]
+            + ([fp8_kwargs] if fp8_kwargs else []),
         )
         self.device = self.accelerator.device
         self.num_nodes = int(os.environ.get("NNODES", 1))
@@ -130,10 +133,7 @@ class RLTrainer:
         )
 
         if self.cfg.train.fp8_training:
-            fp8ify_module(
-                self.model
-            )
-        print(f"Model {self.model} loaded")
+            fp8ify_module(self.model)
         self.logger.info(f"Hot model loaded.")
 
         # Reference model
@@ -380,7 +380,7 @@ class RLTrainer:
         # average over reward functions
         n_fn = len(self.reward_functions)
         return [val / n_fn for val in rewards_per_gen]
-    
+
     def _compute_advantages(self, rewards: List[float], group_size: int) -> List[float]:
         grouped = [
             rewards[i : i + group_size] for i in range(0, len(rewards), group_size)
@@ -474,10 +474,14 @@ class RLTrainer:
             logits = logits / self.cfg.model.temperature
 
             logps = torch.nn.functional.log_softmax(logits, dim=-1)
-            per_tok_logps = logps.gather(-1, selected_token_ids.unsqueeze(-1)).squeeze(-1)
+            per_tok_logps = logps.gather(-1, selected_token_ids.unsqueeze(-1)).squeeze(
+                -1
+            )
 
             per_tok_kl = (
-                torch.exp(ref_tensor - per_tok_logps) - (ref_tensor - per_tok_logps) - 1.0
+                torch.exp(ref_tensor - per_tok_logps)
+                - (ref_tensor - per_tok_logps)
+                - 1.0
             )
 
             old_per_tok_logps = per_tok_logps.detach()
@@ -704,7 +708,7 @@ class RLTrainer:
 
         if not hasattr(self.model.optimizer, "offload_states"):
             return
-        
+
         self.logger.info("Reloading optimizer and policy from CPU")
         self.model.optimizer.reload_states(non_blocking=True)
         torch.cuda.empty_cache()

@@ -1,15 +1,10 @@
-import argparse
 import functools
 import logging
-
-from contextlib import contextmanager
-from copy import deepcopy
 
 import torch
 import deepspeed
 from torch.optim.lr_scheduler import LambdaLR
 from datasets import load_dataset, Dataset, concatenate_datasets
-from configs.cfg import DatasetConfig
 from concurrent.futures import ThreadPoolExecutor
 import pynvml
 pynvml.nvmlInit()
@@ -68,43 +63,6 @@ def init_logger(rank=0):
     return logger
 
 
-PRECISION_STR_TO_DTYPE = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-    "fp64": torch.float64,
-}
-
-
-def get_num_params(model: torch.nn.Module, exclude_embedding: bool = False) -> int:
-    num_params = sum(p.numel() for p in model.parameters())
-    if exclude_embedding:
-        num_params -= sum(
-            sum(p.numel() for p in m.parameters())
-            for m in model.children()
-            if isinstance(m, torch.nn.Embedding)
-        )
-    return num_params
-
-
-def get_num_flop_per_token(num_params: int, model_config) -> int:
-    l, h, q, t = (
-        model_config.n_layers,
-        model_config.n_heads,
-        model_config.dim // model_config.n_heads,
-        model_config.seq_len,
-    )
-    # Reasoning behind the factor of 12 for the self-attention part of the formula:
-    # 1. each self-attention has 2 matmul in the forward and 4 in the backward (6)
-    # 2. the flash attention does 1 more matmul recomputation in the backward
-    #    but recomputation should not be counted in calculating MFU           (+0)
-    # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
-    # 4. we follow the convention and do not account for sparsity in causal attention
-    flop_per_token = 6 * num_params + 12 * l * h * q * t
-
-    return flop_per_token
-
-
 def build_lr_scheduler(optimizer: torch.optim, warmup_steps: int):
 
     def linear_warmup_constant(
@@ -138,7 +96,7 @@ def clip_grad_norm_(parameters, grad_max_norm):
   torch.nn.utils.clip_grads_with_norm_(parameters, grad_max_norm, total_norm)
   return total_norm
 
-def load_datasets(cfg: DatasetConfig, seed: int) -> Dataset:
+def load_datasets(cfg, seed: int) -> Dataset:
     
     train_datasets = []
 

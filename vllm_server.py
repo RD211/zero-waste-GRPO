@@ -7,13 +7,13 @@ from typing import List
 from fastapi import FastAPI
 from pydantic import BaseModel
 from configs.cfg import RLModelTrainingConfig
-from shared_memory import load_shared_state_dict
+from src.utils.shared_memory import load_shared_state_dict
 from hydra.core.config_store import ConfigStore
 from vllm import SamplingParams
-from vllm_inference import SimplevLLMInference
-from slurm_utils import *
+from src.vllm.vllm_inference import SimplevLLMInference
+from src.utils.slurm_utils import *
 from dotenv import load_dotenv
-from utils import init_logger
+from src.utils.utils import init_logger
 
 load_dotenv()
 

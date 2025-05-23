@@ -31,7 +31,6 @@ def accuracy_reward_func(
         answer_completion = completion[start:end]
         # Check if the answer is correct
         if answer_completion.strip() == str(answer).strip():
-            print("Answer is correct")
             return 1.0
         else:
             return -1.0

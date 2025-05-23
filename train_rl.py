@@ -4,9 +4,9 @@ from omegaconf import OmegaConf
 from transformers import AutoTokenizer, set_seed
 
 from configs.cfg import RLModelTrainingConfig
-from utils import load_datasets
+from src.utils.utils import load_datasets
 from rewards import thinking_reward_func, accuracy_reward_func, length_reward_func
-from trainer import RLTrainer
+from src.grpo.trainer import RLTrainer
 from dotenv import load_dotenv
 from pathlib import Path
 import subprocess, os

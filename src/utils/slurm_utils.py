@@ -1,12 +1,14 @@
 import os
 import re
 import signal
-from utils import init_logger
+from src.utils.utils import init_logger
 import subprocess
+
 logger = init_logger(rank=os.getenv("RANK", 0))
 
 SLURM_JOB_ID = os.environ.get("SLURM_JOB_ID")
 SHOULD_QUIT = False
+
 
 def get_slurm_time_left():
     job_id = os.getenv("SLURM_JOB_ID")
@@ -40,16 +42,18 @@ def handle_sigusr1(signum, frame):
     global SHOULD_QUIT
     logger.info(f"Received signal {signum}. Quitting soon...")
     SHOULD_QUIT = True
-    
+
+
 def received_term():
     global SHOULD_QUIT
     return SHOULD_QUIT
+
 
 def seconds_left():
     global SLURM_JOB_ID
     if not SLURM_JOB_ID:
         return 1000000
     return get_slurm_time_left()
-    
+
 
 signal.signal(signal.SIGUSR1, handle_sigusr1)
